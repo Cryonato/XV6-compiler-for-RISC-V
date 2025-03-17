@@ -401,13 +401,16 @@ int fork(void)
         return -1;
     }
 
-    // Copy user memory from parent to child.
-    if (uvmcopy(p->pagetable, np->pagetable, p->sz) < 0)
-    {
-        freeproc(np);
-        release(&np->lock);
-        return -1;
-    }
+    // Make np->pagetable point to p->pagetable
+    // mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+    acquire(&p->lock);
+    pagetable_t p_pagetable = p->pagetable;
+    uint64 va = p->pagetable;
+    uint64 pa = va2pa(va, p->pid);
+    mappages()
+    
+    
+    release(&p->lock);
     np->sz = p->sz;
 
     // copy saved user registers.
