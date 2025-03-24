@@ -11,9 +11,16 @@
  */
 pagetable_t kernel_pagetable;
 
+
+
+struct phys_addr_refcount phys_addr_refcount_table[MAXPHYSICALFRAMES];
+
+
 extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
+
+
 
 // Make a direct-map page table for the kernel.
 pagetable_t
@@ -31,7 +38,7 @@ kvmmake(void)
   kvmmap(kpgtbl, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
 
   // PLIC
-  kvmmap(kpgtbl, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+  kvmmap(kpgtbl, PLIC, PLIC, 400000, PTE_R | PTE_W);
 
   // map kernel text executable and read-only.
   kvmmap(kpgtbl, KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
@@ -155,6 +162,7 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
       return -1;
     if(*pte & PTE_V)
       panic("mappages: remap");
+    increment_ref_count(pa);
     *pte = PA2PTE(pa) | perm | PTE_V;
     if(a == last)
       break;
@@ -164,11 +172,100 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
   return 0;
 }
 
+void init_phys_addr_refcount_table() {
+  for (int i = 0; i < MAXPHYSICALFRAMES; i++) {
+    phys_addr_refcount_table[i].pa = 0;
+    phys_addr_refcount_table[i].ref_count = 0;
+  }
+}
+
+// Increment the reference count for a physical address
+void increment_ref_count(uint64 pa) {
+  // Align the physical address to page boundary
+  pa = PGROUNDDOWN(pa);
+
+  int mmio = 0;
+\
+  // Special case: Allow MMIO regions
+  if (pa == UART0 || pa == VIRTIO0 || (pa >= PLIC && pa < PLIC + 0x400000)) {
+    return;  // Allow mapping without reference counting
+  }
+  
+  // Check if address is within valid physical memory range
+  if ((pa < KERNBASE || pa >= PHYSTOP) &&  !mmio) {
+    printf("Error: PA %p outside valid range [%p, %p]\n", 
+           pa, KERNBASE, PHYSTOP);
+    panic("increment_ref_count: invalid physical address");
+  }
+
+  for (int i = 0; i < MAXPHYSICALFRAMES; i++) {
+    if (phys_addr_refcount_table[i].pa == pa) {
+      phys_addr_refcount_table[i].ref_count++;
+      return;
+    }
+  }
+  // If the physical address is not found, add it to the table
+  for (int i = 0; i < MAXPHYSICALFRAMES; i++) {
+    if (phys_addr_refcount_table[i].ref_count == 0) {
+      phys_addr_refcount_table[i].pa = pa;
+      phys_addr_refcount_table[i].ref_count = 1;
+      return;
+    }
+  }
+
+  // Table is full - print diagnostic information
+  printf("phys_addr_refcount_table is full: %d entries\n", MAXPHYSICALFRAMES);
+  printf("Failed to add PA: %p\n", pa);
+  if (pa == UART0 || pa == VIRTIO0 || (pa >= PLIC && pa < PLIC + 0x400000)) {
+    printf("Debug: This is MMIO region at %p\n", (uint)pa);
+  }
+  
+  panic("increment_ref_count: no space in phys_addr_refcount_table");
+}
+
+// Decrement the reference count for a physical address and deallocate if it hits zero
+void decrement_ref_count(uint64 pa) {
+  pa = PGROUNDDOWN(pa);
+
+  for (int i = 0; i < MAXPHYSICALFRAMES; i++) {
+    if (phys_addr_refcount_table[i].pa == pa) {
+      phys_addr_refcount_table[i].ref_count--;
+      if (phys_addr_refcount_table[i].ref_count == 0) {
+        kfree((void*)pa);  // Deallocate the physical address
+        phys_addr_refcount_table[i].pa = 0;
+      }
+      return;
+    }
+  }
+  panic("decrement_ref_count: physical address not found");
+}
+
+uint64
+uvmfind(pagetable_t pagetable, uint64 pa)
+{
+  pte_t *pte;
+  uint64 va;
+
+  // Iterate over the entire virtual address space.
+  // MAXVA is assumed to be the maximum valid virtual address.
+  for(va = 0; va < MAXVA; va += PGSIZE){
+    pte = walk(pagetable, va, 0);
+    if(pte == 0)
+      continue;             // No page table entry for this va.
+    if((*pte & PTE_V) == 0)
+      continue;             // Entry is not valid.
+    if(PTE2PA(*pte) == pa)
+      return va;            // Found the mapping; return the virtual address.
+  }
+  return 0;                 // No mapping found.
+}
+
+
 // Remove npages of mappings starting from va. va must be
 // page-aligned. The mappings must exist.
 // Optionally free the physical memory.
 void
-uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages)
 {
   uint64 a;
   pte_t *pte;
@@ -183,10 +280,9 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
       panic("uvmunmap: not mapped");
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
-    if(do_free){
-      uint64 pa = PTE2PA(*pte);
-      kfree((void*)pa);
-    }
+    uint64 pa = PTE2PA(*pte);
+
+    decrement_ref_count(pa);
     *pte = 0;
   }
 }
@@ -260,7 +356,7 @@ uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
 
   if(PGROUNDUP(newsz) < PGROUNDUP(oldsz)){
     int npages = (PGROUNDUP(oldsz) - PGROUNDUP(newsz)) / PGSIZE;
-    uvmunmap(pagetable, PGROUNDUP(newsz), npages, 1);
+    uvmunmap(pagetable, PGROUNDUP(newsz), npages);
   }
 
   return newsz;
@@ -292,7 +388,7 @@ void
 uvmfree(pagetable_t pagetable, uint64 sz)
 {
   if(sz > 0)
-    uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 1);
+    uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE);
   freewalk(pagetable);
 }
 
@@ -328,8 +424,46 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   return 0;
 
  err:
-  uvmunmap(new, 0, i / PGSIZE, 1);
+  uvmunmap(new, 0, i / PGSIZE);
   return -1;
+}
+
+// Custom function that maps child pagetable to parent pagetable
+
+// TODO use the PTE_S flag to differentiate between page tables in parent that
+// didn't have write permission and the rest
+int
+uvmremap(pagetable_t parent, pagetable_t child, uint64 sz)
+{
+  pte_t *pte;
+  uint64 pa, i;
+  uint flags;
+
+  for(i = 0; i < sz; i += PGSIZE){
+    if((pte = walk(parent, i, 0)) == 0)
+      panic("uvmremap: pte should exist");
+    if((*pte & PTE_V) == 0)
+      panic("uvmremap: page not present");
+    pa = PTE2PA(*pte);
+    
+    if ((*pte & PTE_W) == 0){   // Separates cow-pages and write-protected pages
+      *pte = *pte  | PTE_U;
+    }
+    flags = PTE_FLAGS(*pte) & ~PTE_W;
+    // Remove previous mapping
+    uvmunmap(parent, i, 1);
+    // Remove write permission from parent pagetable
+    if(mappages(parent, i, PGSIZE, pa, flags) != 0){
+      panic("uvmremap: couldnt remap pte for parent");
+    }
+
+    // Mappinig new page table netry to child
+    if(mappages(child, i, PGSIZE, pa, flags) != 0){
+      panic("uvmremap: couldnt map pte to child");
+    }
+  }
+  return 0;
+
 }
 
 // mark a PTE invalid for user access.

@@ -96,6 +96,18 @@ uint64 va2pa(uint64 va, uint64 pid){
     }
     return pa;
 }
+// Remove the pte from all processes pagetables
+void free_pte(pte_t *pte){
+    struct proc *p;
+    uint64 pa = PTE2PA(*pte);
+    for (p = proc; p < &proc[NPROC]; p++){
+        pagetable_t pt = p->pagetable;
+        uint64 va = uvmfind(pt, pa);
+        if (va != 0){
+            uvmunmap(pt, va, 1);
+        }
+    }
+}
 
 struct user_proc *ps(uint8 start, uint8 count)
 {
@@ -310,7 +322,7 @@ proc_pagetable(struct proc *p)
     if (mappages(pagetable, TRAPFRAME, PGSIZE,
                  (uint64)(p->trapframe), PTE_R | PTE_W) < 0)
     {
-        uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+        uvmunmap(pagetable, TRAMPOLINE, 1);
         uvmfree(pagetable, 0);
         return 0;
     }
@@ -322,8 +334,8 @@ proc_pagetable(struct proc *p)
 // physical memory it refers to.
 void proc_freepagetable(pagetable_t pagetable, uint64 sz)
 {
-    uvmunmap(pagetable, TRAMPOLINE, 1, 0);
-    uvmunmap(pagetable, TRAPFRAME, 1, 0);
+    uvmunmap(pagetable, TRAMPOLINE, 1);
+    uvmunmap(pagetable, TRAPFRAME, 1);
     uvmfree(pagetable, sz);
 }
 
@@ -401,16 +413,12 @@ int fork(void)
         return -1;
     }
 
-    // Make np->pagetable point to p->pagetable
-    // mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
-    acquire(&p->lock);
-    pagetable_t p_pagetable = p->pagetable;
-    uint64 va = p->pagetable;
-    uint64 pa = va2pa(va, p->pid);
-    mappages()
-    
-    
-    release(&p->lock);
+    // Copy user memory from parent to child.
+    if (uvmremap(p->pagetable, np->pagetable, p->sz) < 0)
+    {
+        release(&np->lock);
+        return -1;
+    }
     np->sz = p->sz;
 
     // copy saved user registers.
@@ -441,6 +449,8 @@ int fork(void)
 
     return pid;
 }
+
+// 
 
 // Pass p's abandoned children to init.
 // Caller must hold wait_lock.

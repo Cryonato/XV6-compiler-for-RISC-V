@@ -12,6 +12,7 @@
 uint64 MAX_PAGES = 0;
 uint64 FREE_PAGES = 0;
 
+
 void freerange(void *pa_start, void *pa_end);
 
 extern char end[]; // first address after kernel.
@@ -57,7 +58,7 @@ void kfree(void *pa)
 
     if (((uint64)pa % PGSIZE) != 0 || (char *)pa < end || (uint64)pa >= PHYSTOP)
         panic("kfree");
-
+    
     // Fill with junk to catch dangling refs.
     memset(pa, 1, PGSIZE);
 
@@ -88,5 +89,6 @@ kalloc(void)
     if (r)
         memset((char *)r, 5, PGSIZE); // fill with junk
     FREE_PAGES--;
+    increment_ref_count((uint64) r);
     return (void *)r;
 }

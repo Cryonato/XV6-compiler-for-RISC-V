@@ -4,6 +4,7 @@ struct file;
 struct inode;
 struct pipe;
 struct proc;
+struct phys_addr_refcount;
 struct user_proc;
 struct spinlock;
 struct sleeplock;
@@ -114,16 +115,15 @@ void wakeup(void *);
 void yield(void);
 int either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
 int either_copyin(void *dst, int user_src, uint64 src, uint64 len);
-
 void procdump(void);
 // We allocate memory in the callers memory space
 struct user_proc *ps(uint8 start, uint8 count);
 void schedls(void);
 void schedset(int id);
-
 // Custom functions
 
 uint64 va2pa(uint64 va, uint64 pid);
+void free_pte(pte_t *pte);
 
 // swtch.S
 void swtch(struct context *, struct context *);
@@ -184,13 +184,19 @@ uint64 uvmalloc(pagetable_t, uint64, uint64, int);
 uint64 uvmdealloc(pagetable_t, uint64, uint64);
 int uvmcopy(pagetable_t, pagetable_t, uint64);
 void uvmfree(pagetable_t, uint64);
-void uvmunmap(pagetable_t, uint64, uint64, int);
+void uvmunmap(pagetable_t, uint64, uint64);
 void uvmclear(pagetable_t, uint64);
 pte_t *walk(pagetable_t, uint64, int);
 uint64 walkaddr(pagetable_t, uint64);
 int copyout(pagetable_t, uint64, char *, uint64);
 int copyin(pagetable_t, char *, uint64, uint64);
 int copyinstr(pagetable_t, char *, uint64, uint64);
+// Custom
+int uvmremap(pagetable_t, pagetable_t, uint64);
+void init_phys_addr_refcount_table();
+void increment_ref_count(uint64 pa);
+void decrement_ref_count(uint64 pa);
+uint64 uvmfind(pagetable_t pagetable, uint64 pa);
 
 // plic.c
 void plicinit(void);

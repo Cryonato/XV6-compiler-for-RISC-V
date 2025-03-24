@@ -1,5 +1,14 @@
 #ifndef __ASSEMBLER__
 
+
+// Custom for tracking reference counters for page tables
+struct phys_addr_refcount {
+    uint64 pa;  // Physical address
+    int ref_count;  // Reference counter
+};
+  
+  
+
 // which hart (core) is this?
 static inline uint64
 r_mhartid()
@@ -362,3 +371,7 @@ typedef uint64 *pagetable_t; // 512 PTEs
 // Sv39, to avoid having to sign-extend virtual addresses
 // that have the high bit set.
 #define MAXVA (1L << (9 + 9 + 9 + 12 - 1))
+
+
+
+
