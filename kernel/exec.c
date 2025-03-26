@@ -8,14 +8,13 @@
 #include "elf.h"
 
 static int loadseg(pde_t *, uint64, struct inode *, uint, uint);
-static int add_pagetable_modifications(pagetable_t oldpagetable, pagetable_t newpagetable, uint64 oldsz, uint64 sz);
 
 
 int flags2perm(int flags)
 {
-    int perm = 0;
+    int perm = PTE_R;
     if(flags & 0x1)
-      perm = PTE_X;
+      perm |= PTE_X;
     if(flags & 0x2)
       perm |= PTE_W;
     return perm;
@@ -82,7 +81,7 @@ exec(char *path, char **argv)
   // Use the second as the user stack.
   sz = PGROUNDUP(sz);
   uint64 sz1;
-  if((sz1 = uvmalloc(pagetable, sz, sz + 2*PGSIZE, PTE_W)) == 0)
+  if((sz1 = uvmalloc(pagetable, sz, sz + 2*PGSIZE, PTE_R | PTE_W)) == 0)
     goto bad;
   sz = sz1;
   uvmclear(pagetable, sz-2*PGSIZE);
@@ -125,9 +124,7 @@ exec(char *path, char **argv)
   // Keep previous page table entries if no modifications have been made
   oldpagetable = p->pagetable;
 
-  if (add_pagetable_modifications(oldpagetable, pagetable, oldsz, sz) < 0){
-    goto bad;
-  }
+
 
   // Commit to the user image.
   
@@ -174,41 +171,4 @@ loadseg(pagetable_t pagetable, uint64 va, struct inode *ip, uint offset, uint sz
   return 0;
 }
 
-static int
-add_pagetable_modifications(pagetable_t oldpagetable, pagetable_t pagetable, uint64 oldsz, uint64 newsz){
 
-  for (uint64 va = 0; va < oldsz && va < newsz; va += PGSIZE) {
-    // Get the corresponding page table entries.
-    pte_t *oldpte = walk(oldpagetable, va, 0);
-    pte_t *newpte = walk(pagetable, va, 0);
-    char* mem;
-    // If either entry doesn't exist or is not valid, skip this address.
-    if(oldpte == 0 || newpte == 0 || !(*oldpte & PTE_V) || !(*newpte & PTE_V))
-      continue;
-
-    // Get physical addresses from the entries.
-    uint64 old_pa = PTE2PA(*oldpte);
-    uint64 new_pa = PTE2PA(*newpte);
-    
-    // Compare the contents of the two pages.
-    if(memcmp((void *)old_pa, (void *)new_pa, PGSIZE) == 0) {
-      // Remapping old page table entry
-      free_pte(newpte);
-
-      if ((newpte = kalloc()) == 0){
-        return -1;
-      }
-      memmove(newpte, oldpte, PGSIZE);
-      uint64 flags = PTE_FLAGS(*oldpte);
-      if((mem = kalloc()) == 0){
-        return -1;
-      }
-      memmove(mem, (char*)old_pa, PGSIZE);
-      if(mappages(pagetable, va, PGSIZE, (uint64)mem, flags) != 0){
-        kfree(mem);
-        return -1;
-      }
-    }
-  }
-  return 0;
-}

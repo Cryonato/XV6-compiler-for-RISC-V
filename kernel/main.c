@@ -16,7 +16,7 @@ main()
     printf("\n");
     printf("xv6 kernel is booting\n");
     printf("\n");
-    init_phys_addr_refcount_table(); // Initialize reference counter table
+    init_refcount_table(); // Initialize reference counter table
     kinit();         // physical page allocator
     kvminit();       // create kernel page table
     kvminithart();   // turn on paging

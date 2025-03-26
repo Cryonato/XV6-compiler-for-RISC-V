@@ -5,15 +5,21 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
 
 /*
  * the kernel's page table.
  */
 pagetable_t kernel_pagetable;
 
+struct spinlock refcount_lock;  // Single global lock for all reference counts
 
 
-struct phys_addr_refcount phys_addr_refcount_table[MAXPHYSICALFRAMES];
+
+struct {
+  struct phys_addr_refcount refcount_entry[MAXPHYSICALFRAMES];
+  struct spinlock refcount_lock;
+} refcount_table;
 
 
 extern char etext[];  // kernel.ld sets this to end of kernel code.
@@ -172,10 +178,11 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
   return 0;
 }
 
-void init_phys_addr_refcount_table() {
+void init_refcount_table() {
+
   for (int i = 0; i < MAXPHYSICALFRAMES; i++) {
-    phys_addr_refcount_table[i].pa = 0;
-    phys_addr_refcount_table[i].ref_count = 0;
+    refcount_table.refcount_entry[i].pa = 0;
+    refcount_table.refcount_entry[i].ref_count = 0;
   }
 }
 
@@ -184,59 +191,65 @@ void increment_ref_count(uint64 pa) {
   // Align the physical address to page boundary
   pa = PGROUNDDOWN(pa);
 
-  int mmio = 0;
-\
   // Special case: Allow MMIO regions
   if (pa == UART0 || pa == VIRTIO0 || (pa >= PLIC && pa < PLIC + 0x400000)) {
     return;  // Allow mapping without reference counting
   }
   
   // Check if address is within valid physical memory range
-  if ((pa < KERNBASE || pa >= PHYSTOP) &&  !mmio) {
+  if ((pa < KERNBASE || pa >= PHYSTOP)) {
     printf("Error: PA %p outside valid range [%p, %p]\n", 
            pa, KERNBASE, PHYSTOP);
     panic("increment_ref_count: invalid physical address");
   }
-
+  acquire(&refcount_lock);
   for (int i = 0; i < MAXPHYSICALFRAMES; i++) {
-    if (phys_addr_refcount_table[i].pa == pa) {
-      phys_addr_refcount_table[i].ref_count++;
+    
+    if (refcount_table.refcount_entry[i].pa == pa) {
+      refcount_table.refcount_entry[i].ref_count++;
+      release(&refcount_lock);
       return;
     }
   }
   // If the physical address is not found, add it to the table
   for (int i = 0; i < MAXPHYSICALFRAMES; i++) {
-    if (phys_addr_refcount_table[i].ref_count == 0) {
-      phys_addr_refcount_table[i].pa = pa;
-      phys_addr_refcount_table[i].ref_count = 1;
+    if (refcount_table.refcount_entry[i].ref_count == 0) {
+      refcount_table.refcount_entry[i].pa = pa;
+      refcount_table.refcount_entry[i].ref_count = 1;
+      release(&refcount_lock);
       return;
     }
   }
+  release(&refcount_lock);
 
   // Table is full - print diagnostic information
-  printf("phys_addr_refcount_table is full: %d entries\n", MAXPHYSICALFRAMES);
+  printf("refcount_table is full: %d entries\n", MAXPHYSICALFRAMES);
   printf("Failed to add PA: %p\n", pa);
   if (pa == UART0 || pa == VIRTIO0 || (pa >= PLIC && pa < PLIC + 0x400000)) {
     printf("Debug: This is MMIO region at %p\n", (uint)pa);
   }
   
-  panic("increment_ref_count: no space in phys_addr_refcount_table");
+  panic("increment_ref_count: no space in refcount_table");
 }
 
 // Decrement the reference count for a physical address and deallocate if it hits zero
 void decrement_ref_count(uint64 pa) {
   pa = PGROUNDDOWN(pa);
 
+  acquire(&refcount_lock);
   for (int i = 0; i < MAXPHYSICALFRAMES; i++) {
-    if (phys_addr_refcount_table[i].pa == pa) {
-      phys_addr_refcount_table[i].ref_count--;
-      if (phys_addr_refcount_table[i].ref_count == 0) {
+    if (refcount_table.refcount_entry[i].pa == pa) {
+      refcount_table.refcount_entry[i].ref_count--;
+      if (refcount_table.refcount_entry[i].ref_count == 0) {
         kfree((void*)pa);  // Deallocate the physical address
-        phys_addr_refcount_table[i].pa = 0;
+        refcount_table.refcount_entry[i].pa = 0;
       }
+      release(&refcount_lock);
       return;
     }
   }
+  release(&refcount_lock);
+
   panic("decrement_ref_count: physical address not found");
 }
 
@@ -259,6 +272,21 @@ uvmfind(pagetable_t pagetable, uint64 pa)
   }
   return 0;                 // No mapping found.
 }
+
+int
+find_ref_count(uint64 pa){
+  pa = PGROUNDDOWN(pa);
+
+  for (int i = 0; i < MAXPHYSICALFRAMES; i++) {
+    if (refcount_table.refcount_entry[i].pa == pa) {
+      return refcount_table.refcount_entry[i].ref_count;
+    }
+      
+  }
+  panic("cow_fault: physical page not found in refcount table");
+}
+
+
 
 
 // Remove npages of mappings starting from va. va must be
@@ -430,8 +458,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 
 // Custom function that maps child pagetable to parent pagetable
 
-// TODO use the PTE_S flag to differentiate between page tables in parent that
-// didn't have write permission and the rest
+// TODO use the PTE_S flag to differentiate between cow and write protected pages
 int
 uvmremap(pagetable_t parent, pagetable_t child, uint64 sz)
 {
@@ -444,27 +471,26 @@ uvmremap(pagetable_t parent, pagetable_t child, uint64 sz)
       panic("uvmremap: pte should exist");
     if((*pte & PTE_V) == 0)
       panic("uvmremap: page not present");
-    pa = PTE2PA(*pte);
-    
-    if ((*pte & PTE_W) == 0){   // Separates cow-pages and write-protected pages
-      *pte = *pte  | PTE_U;
-    }
-    flags = PTE_FLAGS(*pte) & ~PTE_W;
-    // Remove previous mapping
-    uvmunmap(parent, i, 1);
-    // Remove write permission from parent pagetable
-    if(mappages(parent, i, PGSIZE, pa, flags) != 0){
-      panic("uvmremap: couldnt remap pte for parent");
-    }
 
+    pa = PTE2PA(*pte);
+    flags = PTE_FLAGS(*pte);
+    
+    // If the page was writable, mark it as COW (clear PTE_W, set a custom COW flag)
+    if (flags & PTE_W) {
+      flags = flags | PTE_COW; // Use a reserved bit for COW entries
+      *pte = *pte  | PTE_COW;
+    }
+    flags = flags & ~PTE_W;
+    *pte = *pte & ~PTE_W;        // Updates the parents page table entry
     // Mappinig new page table netry to child
     if(mappages(child, i, PGSIZE, pa, flags) != 0){
       panic("uvmremap: couldnt map pte to child");
     }
   }
   return 0;
-
 }
+
+
 
 // mark a PTE invalid for user access.
 // used by exec for the user stack guard page.
@@ -486,15 +512,33 @@ int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
+  pte_t *pte;
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
+    // Get the PTE to check for COW
+    pte = walk(pagetable, va0, 0);
+    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
       return -1;
+
+    // Handle COW if needed
+    if(*pte & PTE_COW) {
+      uint64 pa = PTE2PA(*pte);
+      char *mem = kalloc();
+      if(mem == 0)
+        return -1;
+      memmove(mem, (char*)pa, PGSIZE);
+      uint flags = (PTE_FLAGS(*pte) & ~PTE_COW) | PTE_W;
+      // Update PTE with new page and flags
+      *pte = PA2PTE(mem) | flags;
+      *pte = *pte & ~PTE_COW;
+      increment_ref_count((uint64)mem);
+      decrement_ref_count(pa);
+    }
+
+    pa0 = PTE2PA(*pte);
     n = PGSIZE - (dstva - va0);
-    if(n > len)
-      n = len;
+    if(n > len) n = len;
     memmove((void *)(pa0 + (dstva - va0)), src, n);
 
     len -= n;

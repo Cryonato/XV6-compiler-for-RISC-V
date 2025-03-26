@@ -38,6 +38,7 @@ usertrap(void)
 {
   int which_dev = 0;
 
+
   if((r_sstatus() & SSTATUS_SPP) != 0)
     panic("usertrap: not from user mode");
 
@@ -65,6 +66,13 @@ usertrap(void)
     intr_on();
 
     syscall();
+  } else if (r_scause() == 15){
+    uint64 fault_addr = r_stval();
+    if(cow_fault(p, fault_addr) < 0){
+      p->killed = 1;
+      printf("cow_fault failed for pid %d at va %p\n", p->pid, fault_addr);
+      setkilled(p);
+    }
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {
@@ -82,6 +90,60 @@ usertrap(void)
 
   usertrapret();
 }
+
+
+int
+cow_fault(struct proc *p, uint64 fault_addr)
+{
+  printf("I exist!");
+  // Round fault address down to page boundary.
+  uint64 va = PGROUNDDOWN(fault_addr);
+  pte_t *pte = walk(p->pagetable, va, 0);
+  if(pte == 0 || !(*pte & PTE_V))
+    return -1;  // no valid mapping
+
+  // Only handle pages shared via vfork:
+  // Our convention is that such pages have the custom COW marker PTE_U and are not writable.
+  if(((*pte & ~PTE_COW) == 0) || (*pte & PTE_W))
+    return -1;  // not a vfork-shared COW page
+
+  uint64 old_pa = PTE2PA(*pte);
+  uint flags = PTE_FLAGS(*pte);
+
+  // Look up the reference count for the physical page.
+  int ref_count = find_ref_count(old_pa);
+
+
+  if(ref_count > 1){
+    // Shared by more than one mapping; allocate a new page and copy its contents.
+    char *new_page = kalloc();
+    if(new_page == 0)
+      return -1;
+    
+    // Copy old page contents before unmapping.
+    memmove(new_page, (char *)old_pa, PGSIZE);
+
+    // Remove the old mapping. This call decrements the refcount.
+    uvmunmap(p->pagetable, va, 1);
+
+    // Remap the faulting virtual address to the new page:
+    // remove the COW marker (clear PTE_COW) and grant write permission.
+    if(mappages(p->pagetable, va, PGSIZE, (uint64)new_page,
+                (flags & PTE_COW) | PTE_W) != 0){
+      kfree(new_page);
+      return -1;
+    }
+  } else {
+    // Only one reference exists.
+    // Simply update the mapping in place: clear the COW flag and add write permission.
+    *pte = PA2PTE(old_pa) | ((flags | PTE_W) & ~PTE_COW);
+  }
+
+  // Flush the TLB so that the new mapping takes effect.
+  sfence_vma();
+  return 0;
+}
+
 
 //
 // return to user space

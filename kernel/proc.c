@@ -96,6 +96,7 @@ uint64 va2pa(uint64 va, uint64 pid){
     }
     return pa;
 }
+
 // Remove the pte from all processes pagetables
 void free_pte(pte_t *pte){
     struct proc *p;
@@ -108,6 +109,7 @@ void free_pte(pte_t *pte){
         }
     }
 }
+
 
 struct user_proc *ps(uint8 start, uint8 count)
 {

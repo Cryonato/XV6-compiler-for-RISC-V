@@ -10,6 +10,7 @@ struct spinlock;
 struct sleeplock;
 struct stat;
 struct superblock;
+struct refcount_table;
 
 #define assert(cond)                                        \
     if (!(cond))                                            \
@@ -125,6 +126,7 @@ void schedset(int id);
 uint64 va2pa(uint64 va, uint64 pid);
 void free_pte(pte_t *pte);
 
+
 // swtch.S
 void swtch(struct context *, struct context *);
 
@@ -165,6 +167,7 @@ void trapinit(void);
 void trapinithart(void);
 extern struct spinlock tickslock;
 void usertrapret(void);
+int cow_fault(struct proc *p, uint64 fault_addr);
 
 // uart.c
 void uartinit(void);
@@ -193,10 +196,12 @@ int copyin(pagetable_t, char *, uint64, uint64);
 int copyinstr(pagetable_t, char *, uint64, uint64);
 // Custom
 int uvmremap(pagetable_t, pagetable_t, uint64);
-void init_phys_addr_refcount_table();
+void init_refcount_table();
 void increment_ref_count(uint64 pa);
 void decrement_ref_count(uint64 pa);
 uint64 uvmfind(pagetable_t pagetable, uint64 pa);
+int find_ref_count(uint64 pa);
+
 
 // plic.c
 void plicinit(void);
